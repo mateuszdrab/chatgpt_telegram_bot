@@ -1,12 +1,7 @@
-import os
-import logging
-import traceback
-import html
-import json
-from datetime import datetime
-
-import telegram
-from telegram import Update, User, InlineKeyboardButton, InlineKeyboardMarkup
+import chatgpt
+import database
+import config
+from telegram.constants import ParseMode, ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     CallbackContext,
@@ -15,16 +10,32 @@ from telegram.ext import (
     CallbackQueryHandler,
     filters
 )
-from telegram.constants import ParseMode, ChatAction
+from telegram import Update, User, InlineKeyboardButton, InlineKeyboardMarkup
+import telegram
+import os
+import logging
+import openai
+import traceback
+import html
+import json
+import sys
+import time
+from datetime import datetime
+from logfmter import Logfmter
 
-import config
-import database
-import chatgpt
+formatter = Logfmter(
+    keys=["level"],
+    mapping={"level": "levelname"}
+)
 
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(formatter)
+logging.basicConfig(handlers=[handler])
 
 # setup
 db = database.Database()
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
 
 HELP_MESSAGE = """Commands:
 ⚪ /retry – Regenerate last bot answer
@@ -34,29 +45,36 @@ HELP_MESSAGE = """Commands:
 ⚪ /help – Show help
 """
 
+
 async def register_user_if_not_exists(update: Update, context: CallbackContext, user: User):
     if not db.check_if_user_exists(user.id):
+        logger.debug("Registering new user", extra={
+            "user_id": user.id,
+            "user_name": user.username,
+            "first_name": user.first_name,
+            "last_name": user.last_name
+        })
         db.add_new_user(
             user.id,
             update.message.chat_id,
             username=user.username,
             first_name=user.first_name,
-            last_name= user.last_name
+            last_name=user.last_name
         )
 
 
 async def start_handle(update: Update, context: CallbackContext):
     await register_user_if_not_exists(update, context, update.message.from_user)
     user_id = update.message.from_user.id
-    
+
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
     db.start_new_dialog(user_id)
-    
+
     reply_text = "Hi! I'm <b>ChatGPT</b> bot implemented with GPT-3.5 OpenAI API 🤖\n\n"
     reply_text += HELP_MESSAGE
 
     reply_text += "\nAnd now... ask me anything!"
-    
+
     await update.message.reply_text(reply_text, parse_mode=ParseMode.HTML)
 
 
@@ -78,7 +96,8 @@ async def retry_handle(update: Update, context: CallbackContext):
         return
 
     last_dialog_message = dialog_messages.pop()
-    db.set_dialog_messages(user_id, dialog_messages, dialog_id=None)  # last message was removed from the context
+    # last message was removed from the context
+    db.set_dialog_messages(user_id, dialog_messages, dialog_id=None)
 
     await message_handle(update, context, message=last_dialog_message["user"], use_new_dialog_timeout=False)
 
@@ -88,7 +107,7 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
     if update.edited_message is not None:
         await edited_message_handle(update, context)
         return
-        
+
     await register_user_if_not_exists(update, context, update.message.from_user)
     user_id = update.message.from_user.id
 
@@ -96,7 +115,16 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
     if use_new_dialog_timeout:
         if (datetime.now() - db.get_user_attribute(user_id, "last_interaction")).seconds > config.new_dialog_timeout:
             db.start_new_dialog(user_id)
-            await update.message.reply_text("Starting new dialog due to timeout ✅")
+            # await update.message.reply_text("Starting new dialog due to timeout ✅")
+
+    # check and start dialog if needed
+    dialogs = None
+    while dialogs is None:
+        try:
+            dialogs = db.get_dialog_messages(user_id, dialog_id=None)
+        except:
+            db.start_new_dialog(user_id)
+
     db.set_user_attribute(user_id, "last_interaction", datetime.now())
 
     # send typing action
@@ -104,27 +132,53 @@ async def message_handle(update: Update, context: CallbackContext, message=None,
 
     try:
         message = message or update.message.text
+        logger.info("Handing message", extra={
+            "user_id": user_id, "content": message})
 
-        answer, prompt, n_used_tokens, n_first_dialog_messages_removed = chatgpt.ChatGPT().send_message(
-            message,
-            dialog_messages=db.get_dialog_messages(user_id, dialog_id=None),
-            chat_mode=db.get_user_attribute(user_id, "current_chat_mode"),
-        )
+        backoff_time = 60
+        retries = 5
+        answer = None
+
+        while answer is None and retries > 0:
+            try:
+                answer, prompt, n_used_tokens, n_first_dialog_messages_removed = chatgpt.ChatGPT(logger).send_message(
+                    message,
+                    dialog_messages=dialogs,
+                    chat_mode=db.get_user_attribute(
+                        user_id, "current_chat_mode"),
+                )
+
+            except openai.error.OpenAIError:
+                logger.exception("OpenAIError")
+                time.sleep(backoff_time)
+                backoff_time *= 1.5
+                retries -= 1
+                await update.message.reply_text("🤔 This is taking longer than expected\nLet me try again... ({retries} retries left)".format(
+                    retries=retries))
+
+        if answer is None and retries == 0:
+            raise Exception(
+                "Could not obtain a response after multiple retries.")
 
         # update user data
-        new_dialog_message = {"user": message, "bot": answer, "date": datetime.now()}
+        new_dialog_message = {"user": message,
+                              "bot": answer, "date": datetime.now()}
         db.set_dialog_messages(
             user_id,
-            db.get_dialog_messages(user_id, dialog_id=None) + [new_dialog_message],
+            db.get_dialog_messages(
+                user_id, dialog_id=None) + [new_dialog_message],
             dialog_id=None
         )
 
-        db.set_user_attribute(user_id, "n_used_tokens", n_used_tokens + db.get_user_attribute(user_id, "n_used_tokens"))
+        db.set_user_attribute(user_id, "n_used_tokens", n_used_tokens +
+                              db.get_user_attribute(user_id, "n_used_tokens"))
+        logger.info("Message handled", extra={
+            "user_id": user_id, "tokens_used": n_used_tokens, "response": answer, "messages_removed": n_first_dialog_messages_removed})
 
     except Exception as e:
         error_text = f"Something went wrong during completion. Reason: {e}"
-        logger.error(error_text)
         await update.message.reply_text(error_text)
+        logger.exception(error_text)
         return
 
     # send message if some messages were removed from the context
@@ -152,6 +206,8 @@ async def new_dialog_handle(update: Update, context: CallbackContext):
 
     chat_mode = db.get_user_attribute(user_id, "current_chat_mode")
     await update.message.reply_text(f"{chatgpt.CHAT_MODES[chat_mode]['welcome_message']}", parse_mode=ParseMode.HTML)
+    logger.debug("Started new dialog", extra={
+                 "user_id": user_id, "chat_mode": chat_mode})
 
 
 async def show_chat_modes_handle(update: Update, context: CallbackContext):
@@ -161,7 +217,8 @@ async def show_chat_modes_handle(update: Update, context: CallbackContext):
 
     keyboard = []
     for chat_mode, chat_mode_dict in chatgpt.CHAT_MODES.items():
-        keyboard.append([InlineKeyboardButton(chat_mode_dict["name"], callback_data=f"set_chat_mode|{chat_mode}")])
+        keyboard.append([InlineKeyboardButton(
+            chat_mode_dict["name"], callback_data=f"set_chat_mode|{chat_mode}")])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text("Select chat mode:", reply_markup=reply_markup)
@@ -200,6 +257,8 @@ async def show_balance_handle(update: Update, context: CallbackContext):
     text += f"You used <b>{n_used_tokens}</b> tokens <i>(price: 0.01$ per 1000 tokens)</i>\n"
 
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    logger.debug("Balance update", extra={
+                 "user_id": user_id, "tokens_used": n_used_tokens, "cost": n_spent_dollars})
 
 
 async def edited_message_handle(update: Update, context: CallbackContext):
@@ -208,11 +267,13 @@ async def edited_message_handle(update: Update, context: CallbackContext):
 
 
 async def error_handle(update: Update, context: CallbackContext) -> None:
-    logger.error(msg="Exception while handling an update:", exc_info=context.error)
+    logger.error(msg="Exception while handling an update",
+                 exc_info=context.error)
 
     try:
         # collect error message
-        tb_list = traceback.format_exception(None, context.error, context.error.__traceback__)
+        tb_list = traceback.format_exception(
+            None, context.error, context.error.__traceback__)
         tb_string = "".join(tb_list)[:2000]
         update_str = update.to_dict() if isinstance(update, Update) else str(update)
         message = (
@@ -222,13 +283,18 @@ async def error_handle(update: Update, context: CallbackContext) -> None:
             f"<pre>{html.escape(tb_string)}</pre>"
         )
 
+        await context.bot.send_message(update.effective_chat.id, message, parse_mode=ParseMode.HTML)
+
         # split text into multiple messages due to 4096 character limit
         message_chunk_size = 4000
-        message_chunks = [message[i:i + message_chunk_size] for i in range(0, len(message), message_chunk_size)]
+        message_chunks = [message[i:i + message_chunk_size]
+                          for i in range(0, len(message), message_chunk_size)]
         for message_chunk in message_chunks:
             await context.bot.send_message(update.effective_chat.id, message_chunk, parse_mode=ParseMode.HTML)
     except:
         await context.bot.send_message(update.effective_chat.id, "Some error in error handler")
+        logger.exception("Error handler error")
+
 
 def run_bot() -> None:
     application = (
@@ -243,20 +309,28 @@ def run_bot() -> None:
     else:
         user_filter = filters.User(username=config.allowed_telegram_usernames)
 
-    application.add_handler(CommandHandler("start", start_handle, filters=user_filter))
-    application.add_handler(CommandHandler("help", help_handle, filters=user_filter))
+    application.add_handler(CommandHandler(
+        "start", start_handle, filters=user_filter))
+    application.add_handler(CommandHandler(
+        "help", help_handle, filters=user_filter))
 
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & user_filter, message_handle))
-    application.add_handler(CommandHandler("retry", retry_handle, filters=user_filter))
-    application.add_handler(CommandHandler("new", new_dialog_handle, filters=user_filter))
-    
-    application.add_handler(CommandHandler("mode", show_chat_modes_handle, filters=user_filter))
-    application.add_handler(CallbackQueryHandler(set_chat_mode_handle, pattern="^set_chat_mode"))
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND & user_filter, message_handle))
+    application.add_handler(CommandHandler(
+        "retry", retry_handle, filters=user_filter))
+    application.add_handler(CommandHandler(
+        "new", new_dialog_handle, filters=user_filter))
 
-    application.add_handler(CommandHandler("balance", show_balance_handle, filters=user_filter))
-    
+    application.add_handler(CommandHandler(
+        "mode", show_chat_modes_handle, filters=user_filter))
+    application.add_handler(CallbackQueryHandler(
+        set_chat_mode_handle, pattern="^set_chat_mode"))
+
+    application.add_handler(CommandHandler(
+        "balance", show_balance_handle, filters=user_filter))
+
     application.add_error_handler(error_handle)
-    
+
     # start the bot
     application.run_polling()
 

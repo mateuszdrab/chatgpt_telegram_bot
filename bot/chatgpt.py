@@ -1,8 +1,7 @@
 import config
-
+import logging
 import openai
 openai.api_key = config.openai_api_key
-
 
 CHAT_MODES = {
     "assistant": {
@@ -32,41 +31,44 @@ CHAT_MODES = {
 
 
 class ChatGPT:
-    def __init__(self):
+    def __init__(self, logger):
+        self.logger = logger
         pass
-    
+
     def send_message(self, message, dialog_messages=[], chat_mode="assistant"):
         if chat_mode not in CHAT_MODES.keys():
             raise ValueError(f"Chat mode {chat_mode} is not supported")
 
+        self.logger.debug("Sending request", extra={"request": message})
         n_dialog_messages_before = len(dialog_messages)
         answer = None
-        while answer is None:
-            prompt = self._generate_prompt(message, dialog_messages, chat_mode)
-            try:
-                r = openai.Completion.create(
-                    engine="text-davinci-003",
-                    prompt=prompt,
-                    temperature=0.7,
-                    max_tokens=1000,
-                    top_p=1,
-                    frequency_penalty=0,
-                    presence_penalty=0,
-                )
-                answer = r.choices[0].text
-                answer = self._postprocess_answer(answer)
 
-                n_used_tokens = r.usage.total_tokens
+        prompt = self._generate_prompt(message, dialog_messages, chat_mode)
+        try:
+            r = openai.Completion.create(
+                engine="text-davinci-003",
+                prompt=prompt,
+                temperature=0.7,
+                max_tokens=1000,
+                top_p=1,
+                frequency_penalty=0,
+                presence_penalty=0,
+                request_timeout=10
+            )
+            answer = r.choices[0].text
+            answer = self._postprocess_answer(answer)
+            n_used_tokens = r.usage.total_tokens
+            n_first_dialog_messages_removed = n_dialog_messages_before - \
+                len(dialog_messages)
+        except openai.error.InvalidRequestError as e:  # too many tokens
+            if len(dialog_messages) == 0:
+                raise ValueError(
+                    "Dialog messages is reduced to zero, but still has too many tokens to make completion") from e
+            self.logger.exception("InvalidRequestError")
+            # forget first message in dialog_messages
+            dialog_messages = dialog_messages[1:]
 
-            except openai.error.InvalidRequestError as e:  # too many tokens
-                if len(dialog_messages) == 0:
-                    raise ValueError("Dialog messages is reduced to zero, but still has too many tokens to make completion") from e
-
-                # forget first message in dialog_messages
-                dialog_messages = dialog_messages[1:]
-
-        n_first_dialog_messages_removed = n_dialog_messages_before - len(dialog_messages)
-
+        self.logger.debug("Sending answer", extra={"answer": answer})
         return answer, prompt, n_used_tokens, n_first_dialog_messages_removed
 
     def _generate_prompt(self, message, dialog_messages, chat_mode):
